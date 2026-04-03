@@ -6,3 +6,4 @@ __pycache__/
 .ruff_cache/
 .tmp/
 artifacts/
+data/layer_sizes.csv

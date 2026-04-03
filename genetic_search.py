@@ -5,38 +5,17 @@ import random
 import signal
 import time
 
-import torch
-
-from genetic_search_lib.checkpoints import load_checkpoint, save_checkpoint
-from genetic_search_lib.config import (
-    ARTIFACTS_DIR,
-    BUBBLE_SORT_ELITES,
-    CHECKPOINT_EVERY,
-    DEFAULT_COMBINATION_CHILDREN,
-    DEFAULT_MAX_BLOCK_SIZE,
-    DEFAULT_POPULATION_SIZE,
-    DEFAULT_RANDOM_INJECTIONS,
-    DEFAULT_SURVIVOR_COUNT,
-    STAGNATION_TRIGGER_GENERATIONS,
-    TOP_K_FULL_4,
-    TOP_K_FULL_8,
-    TOP_K_INITIAL,
-    SearchState,
-)
-from genetic_search_lib.model import evaluate_permutations, get_device, load_dataset, load_layers
-from genetic_search_lib.permutations import (
-    choose_combination_children,
-    encode_permutation,
-    initialize_search,
-    is_valid_permutation,
-)
-from genetic_search_lib.search_ops import (
-    apply_stagnation_probe,
-    improve_population,
-    scaled_small_delta,
-    select_survivors,
-)
-from genetic_search_lib.solution_output import save_solution_file
+DEFAULT_POPULATION_SIZE = 64
+DEFAULT_SURVIVOR_COUNT = 32
+DEFAULT_RANDOM_INJECTIONS = 16
+DEFAULT_COMBINATION_CHILDREN = 16
+DEFAULT_MAX_BLOCK_SIZE = 8
+TOP_K_INITIAL = 32
+TOP_K_FULL_4 = 4
+TOP_K_FULL_8 = 8
+CHECKPOINT_EVERY = 1
+STAGNATION_TRIGGER_GENERATIONS = 5
+BUBBLE_SORT_ELITES = 4
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +37,25 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    import torch
+
+    from genetic_search_lib.checkpoints import load_checkpoint, save_checkpoint
+    from genetic_search_lib.config import ARTIFACTS_DIR, SearchState
+    from genetic_search_lib.model import evaluate_permutations, get_device, load_dataset, load_layers
+    from genetic_search_lib.permutations import (
+        choose_combination_children,
+        encode_permutation,
+        initialize_search,
+        is_valid_permutation,
+    )
+    from genetic_search_lib.search_ops import (
+        apply_stagnation_probe,
+        improve_population,
+        scaled_small_delta,
+        select_survivors,
+    )
+    from genetic_search_lib.solution_output import save_solution_file
+
     rng = random.Random(args.seed)
     torch_generator = torch.Generator()
     torch_generator.manual_seed(args.seed)
