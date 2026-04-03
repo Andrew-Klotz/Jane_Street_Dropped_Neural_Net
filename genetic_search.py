@@ -36,6 +36,7 @@ from genetic_search_lib.search_ops import (
     scaled_small_delta,
     select_survivors,
 )
+from genetic_search_lib.solution_output import save_solution_file
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,6 +153,10 @@ def main() -> None:
             bubble_search_exhausted,
         )
         prior_losses = list(state.population_losses)
+        best_index = min(range(len(improved_population)), key=lambda idx: improved_losses[idx])
+        best_perm = improved_population[best_index]
+        best_full_loss = evaluate_permutations([best_perm], layer_store, dataset, dataset.sample_full)[0]
+        improved_losses[best_index] = best_full_loss
         ranked = sorted(zip(improved_population, improved_losses), key=lambda item: item[1])
         best_perm, best_full_loss = ranked[0]
         if best_full_loss < state.best_loss:
@@ -171,6 +176,10 @@ def main() -> None:
                 torch_generator,
             )
             stagnant_generations = 0
+            best_index = min(range(len(improved_population)), key=lambda idx: improved_losses[idx])
+            best_perm = improved_population[best_index]
+            best_full_loss = evaluate_permutations([best_perm], layer_store, dataset, dataset.sample_full)[0]
+            improved_losses[best_index] = best_full_loss
             ranked = sorted(zip(improved_population, improved_losses), key=lambda item: item[1])
             best_perm, best_full_loss = ranked[0]
 
@@ -296,6 +305,8 @@ def main() -> None:
 
         if best_full_loss <= 0.0:
             print("found zero pred loss on the full dataset")
+            solution_path = save_solution_file(best_perm, ARTIFACTS_DIR)
+            print(f"solution written to {solution_path}")
             save_checkpoint(state, ARTIFACTS_DIR)
             break
 
