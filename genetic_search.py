@@ -35,6 +35,10 @@ DEFAULT_RANDOM_INJECTIONS = 16
 DEFAULT_COMBINATION_CHILDREN = 16
 DEFAULT_MAX_BLOCK_SIZE = 8
 CHECKPOINT_EVERY = 1
+RELATIVE_WEIGHTING = 0.5
+STAGNATION_TRIGGER_GENERATIONS = 5
+STAGNATION_PROBE_BLOCK_SIZES = (1, 2, 4, 8, 12, 16, 24, 32)
+STAGNATION_PROBE_ELITES = 8
 
 @dataclass(frozen=True)
 class AffineLayer:
@@ -825,7 +829,7 @@ def improve_population(
         else:
             if is_elite and exhausted_max_block_size > 0:
                 initial_block_size = max_block_size
-                fallback_block_sizes: list[int] = range(exhausted_max_block_size + 1, max_block_size)
+                fallback_block_sizes = list(range(max_block_size - 1, exhausted_max_block_size, -1))
             else:
                 initial_block_size = rng.randint(1, max_block_size)
                 fallback_block_sizes = (
@@ -910,6 +914,112 @@ def improve_population(
     return improved_population, improvements, improved_losses
 
 
+def best_swap_among_sizes(
+    permutation: Sequence[str],
+    layer_store: LayerStore,
+    dataset: DatasetBundle,
+    block_sizes: Sequence[int],
+    baseline_full_loss: float,
+    args: argparse.Namespace,
+    torch_generator: torch.Generator,
+    top_k_initial_override: int | None = None,
+) -> tuple[tuple[str, ...], dict[str, float | int | None], int | None]:
+    best_permutation = tuple(permutation)
+    best_meta: dict[str, float | int | None] = {
+        "baseline_loss": baseline_full_loss,
+        "best_loss": baseline_full_loss,
+        "improvement": 0.0,
+        "start_a": None,
+        "start_b": None,
+        "finalists": 0,
+    }
+    best_block_size: int | None = None
+
+    for block_size in block_sizes:
+        candidate, meta = best_swap(
+            permutation,
+            layer_store,
+            dataset,
+            block_size=block_size,
+            baseline_full_loss=baseline_full_loss,
+            sample_generator=torch_generator,
+            top_k_initial=top_k_initial_override if top_k_initial_override is not None else args.top_k_initial,
+            top_k_full_4=args.top_k_full_4,
+            top_k_full_8=args.top_k_full_8,
+        )
+        if float(meta["best_loss"]) < float(best_meta["best_loss"]):
+            best_permutation = candidate
+            best_meta = meta
+            best_block_size = block_size
+
+    return best_permutation, best_meta, best_block_size
+
+
+def apply_stagnation_probe(
+    population: Sequence[tuple[str, ...]],
+    prior_losses: Sequence[float],
+    losses: Sequence[float],
+    improvements: Sequence[float],
+    layer_store: LayerStore,
+    dataset: DatasetBundle,
+    args: argparse.Namespace,
+    torch_generator: torch.Generator,
+) -> tuple[list[tuple[str, ...]], list[float], list[float], list[float]]:
+    if not population:
+        return list(population), list(prior_losses), list(losses), list(improvements)
+
+    updated_population = list(population)
+    updated_losses = list(losses)
+    updated_improvements = list(improvements)
+    ranked_indices = sorted(range(len(updated_population)), key=lambda idx: updated_losses[idx])
+    probe_count = min(STAGNATION_PROBE_ELITES, len(ranked_indices))
+    print(
+        f"stagnation probe: checking top {probe_count} elites with block sizes "
+        f"{','.join(str(size) for size in STAGNATION_PROBE_BLOCK_SIZES)}"
+    )
+
+    for elite_rank, population_idx in enumerate(ranked_indices[:probe_count], start=1):
+        candidate, meta, block_size = best_swap_among_sizes(
+            updated_population[population_idx],
+            layer_store,
+            dataset,
+            STAGNATION_PROBE_BLOCK_SIZES,
+            updated_losses[population_idx],
+            args,
+            torch_generator,
+            top_k_initial_override=min(args.top_k_initial * 2, len(updated_population[population_idx])),
+        )
+        if float(meta["best_loss"]) < updated_losses[population_idx]:
+            updated_population[population_idx] = candidate
+            updated_losses[population_idx] = float(meta["best_loss"])
+            updated_improvements[population_idx] = prior_losses[population_idx] - updated_losses[population_idx]
+
+        block_display = "none" if block_size is None else str(block_size)
+        print(
+            f"  stagnation elite {elite_rank:02d}/{probe_count:02d} block={block_display} "
+            f"base={meta['baseline_loss']:.6f} best={meta['best_loss']:.6f} delta={meta['improvement']:.6f}"
+        )
+
+    ranked_indices = sorted(range(len(updated_population)), key=lambda idx: updated_losses[idx])
+    elite_count = min(len(updated_population), max(1, min(args.survivors, len(updated_population)) // 2))
+    protected_count = min(STAGNATION_PROBE_ELITES, elite_count)
+    drop_indices = [
+        idx
+        for idx in ranked_indices[protected_count:elite_count]
+        if updated_improvements[idx] <= 0.0
+    ]
+    if not drop_indices:
+        return updated_population, list(prior_losses), updated_losses, updated_improvements
+
+    drop_set = set(drop_indices)
+    print(f"stagnation pruning: dropping {len(drop_indices)} zero-delta elites outside top {protected_count}")
+    filtered_population = [permutation for idx, permutation in enumerate(updated_population) if idx not in drop_set]
+    filtered_prior_losses = [loss for idx, loss in enumerate(prior_losses) if idx not in drop_set]
+    filtered_losses = [loss for idx, loss in enumerate(updated_losses) if idx not in drop_set]
+    filtered_improvements = [improvement for idx, improvement in enumerate(updated_improvements) if idx not in drop_set]
+    return filtered_population, filtered_prior_losses, filtered_losses, filtered_improvements
+
+
 def select_survivors(
     population: Sequence[tuple[str, ...]],
     losses: Sequence[float],
@@ -946,7 +1056,7 @@ def select_survivors(
     promoted = sorted(
         non_elites,
         key=lambda item: (
-            loss_ranks[id(item)] + 0.3 * relative_improvement_ranks[id(item)],
+            loss_ranks[id(item)] + RELATIVE_WEIGHTING * relative_improvement_ranks[id(item)],
             loss_ranks[id(item)],
             -item[2] / max(item[3], 1e-12),
             item[1],
@@ -999,6 +1109,7 @@ def main() -> None:
         print(f"resumed generation {state.generation} with population {len(state.population)} and block size {state.block_size}")
 
     elite_block_exhaustion: dict[bytes, int] = {}
+    stagnant_generations = 0
     stop_requested = {"value": False}
 
     def handle_signal(signum: int, _frame: object) -> None:
@@ -1039,16 +1150,38 @@ def main() -> None:
             elite_keys,
             elite_block_exhaustion,
         )
+        prior_losses = list(state.population_losses)
+        ranked = sorted(zip(improved_population, improved_losses), key=lambda item: item[1])
+        best_perm, best_full_loss = ranked[0]
+        if best_full_loss < state.best_loss:
+            stagnant_generations = 0
+        else:
+            stagnant_generations += 1
+
+        if stagnant_generations >= STAGNATION_TRIGGER_GENERATIONS:
+            improved_population, prior_losses, improved_losses, improvements = apply_stagnation_probe(
+                improved_population,
+                prior_losses,
+                improved_losses,
+                improvements,
+                layer_store,
+                dataset,
+                args,
+                torch_generator,
+            )
+            stagnant_generations = 0
+            ranked = sorted(zip(improved_population, improved_losses), key=lambda item: item[1])
+            best_perm, best_full_loss = ranked[0]
+
         for permutation, loss in zip(improved_population, improved_losses):
             state.loss_cache[encode_permutation(permutation)] = loss
-        ranked = sorted(zip(improved_population, improved_losses), key=lambda item: item[1])
         ranked_with_improvement = sorted(
             zip(improved_population, improved_losses, improvements),
             key=lambda item: item[1],
         )
-        best_perm, best_full_loss = ranked[0]
         median_loss = ranked[len(ranked) // 2][1]
         avg_improvement = sum(improvements) / max(len(improvements), 1)
+        elite_count = min(len(improved_population), max(1, min(args.survivors, len(improved_population)) // 2))
         elite_avg_improvement = (
             sum(item[2] for item in ranked_with_improvement[:elite_count]) / elite_count
             if elite_count > 0
@@ -1056,6 +1189,7 @@ def main() -> None:
         )
 
         if best_full_loss < state.best_loss:
+            stagnant_generations = 0
             state.best_permutation = best_perm
             state.best_loss = best_full_loss
             print(f"new best full pred loss {best_full_loss:.8f}")
@@ -1065,6 +1199,7 @@ def main() -> None:
             f"full_median={median_loss:.8f} "
             f"avg_swap_delta={avg_improvement:.8f} "
             f"elite_avg_swap_delta={elite_avg_improvement:.8f} "
+            f"stagnant_generations={stagnant_generations} "
             f"elapsed={time.time() - generation_start:.1f}s"
         )
 
@@ -1073,7 +1208,7 @@ def main() -> None:
             improved_population,
             improved_losses,
             improvements,
-            state.population_losses,
+            prior_losses,
             survivor_target,
         )
         survivors = [perm for perm, _ in survivor_pairs]
