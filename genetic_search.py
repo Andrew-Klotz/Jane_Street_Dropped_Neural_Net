@@ -798,29 +798,111 @@ def improve_population(
     args: argparse.Namespace,
     rng: random.Random,
     torch_generator: torch.Generator,
+    elite_keys: set[bytes],
+    elite_block_exhaustion: dict[bytes, int],
 ) -> tuple[list[tuple[str, ...]], list[float], list[float]]:
     improved_population: list[tuple[str, ...]] = []
     improvements: list[float] = []
     improved_losses: list[float] = []
 
     for idx, (permutation, baseline_loss) in enumerate(zip(population, population_losses), start=1):
-        block_size = rng.randint(1, max_block_size)
-        improved, meta = best_swap(
-            permutation,
-            layer_store,
-            dataset,
-            block_size=block_size,
-            baseline_full_loss=baseline_loss,
-            sample_generator=torch_generator,
-            top_k_initial=args.top_k_initial,
-            top_k_full_4=args.top_k_full_4,
-            top_k_full_8=args.top_k_full_8,
-        )
+        permutation_key = encode_permutation(permutation)
+        is_elite = permutation_key in elite_keys
+        exhausted_max_block_size = elite_block_exhaustion.get(permutation_key, 0)
+        attempted_block_sizes: list[int] = []
+
+        if is_elite and exhausted_max_block_size >= max_block_size:
+            improved = tuple(permutation)
+            meta: dict[str, float | int | None] = {
+                "baseline_loss": baseline_loss,
+                "best_loss": baseline_loss,
+                "improvement": 0.0,
+                "start_a": None,
+                "start_b": None,
+                "finalists": 0,
+            }
+            block_display = f"skip<={exhausted_max_block_size}/{max_block_size}"
+        else:
+            if is_elite and exhausted_max_block_size > 0:
+                initial_block_size = max_block_size
+                fallback_block_sizes: list[int] = range(exhausted_max_block_size + 1, max_block_size)
+            else:
+                initial_block_size = rng.randint(1, max_block_size)
+                fallback_block_sizes = (
+                    [
+                        block_size
+                        for block_size in range(max_block_size, 0, -1)
+                        if block_size != initial_block_size
+                    ]
+                    if is_elite
+                    else []
+                )
+
+            improved = tuple(permutation)
+            meta = {
+                "baseline_loss": baseline_loss,
+                "best_loss": baseline_loss,
+                "improvement": 0.0,
+                "start_a": None,
+                "start_b": None,
+                "finalists": 0,
+            }
+
+            attempted_block_sizes.append(initial_block_size)
+            candidate, candidate_meta = best_swap(
+                permutation,
+                layer_store,
+                dataset,
+                block_size=initial_block_size,
+                baseline_full_loss=baseline_loss,
+                sample_generator=torch_generator,
+                top_k_initial=args.top_k_initial,
+                top_k_full_4=args.top_k_full_4,
+                top_k_full_8=args.top_k_full_8,
+            )
+            meta = candidate_meta
+            if float(candidate_meta["improvement"]) > 0.0:
+                improved = candidate
+                elite_block_exhaustion.pop(permutation_key, None)
+                elite_block_exhaustion.pop(encode_permutation(improved), None)
+            else:
+                for block_size in fallback_block_sizes:
+                    attempted_block_sizes.append(block_size)
+                    candidate, candidate_meta = best_swap(
+                        permutation,
+                        layer_store,
+                        dataset,
+                        block_size=block_size,
+                        baseline_full_loss=baseline_loss,
+                        sample_generator=torch_generator,
+                        top_k_initial=args.top_k_initial,
+                        top_k_full_4=args.top_k_full_4,
+                        top_k_full_8=args.top_k_full_8,
+                    )
+                    meta = candidate_meta
+                    if float(candidate_meta["improvement"]) > 0.0:
+                        improved = candidate
+                        elite_block_exhaustion.pop(permutation_key, None)
+                        elite_block_exhaustion.pop(encode_permutation(improved), None)
+                        break
+                else:
+                    if is_elite:
+                        elite_block_exhaustion[permutation_key] = max_block_size
+
+            if attempted_block_sizes:
+                block_display = (
+                    f"{attempted_block_sizes[0]}/{max_block_size}"
+                    if len(attempted_block_sizes) == 1
+                    else f"{','.join(str(size) for size in attempted_block_sizes)}/{max_block_size}"
+                )
+            else:
+                block_display = f"n/a/{max_block_size}"
+
         improved_population.append(improved)
         improvements.append(float(meta["improvement"]))
         improved_losses.append(float(meta["best_loss"]))
         print(
-            f"  perm {idx:03d}/{len(population):03d} block={block_size}/{max_block_size} "
+            f"  perm {idx:03d}/{len(population):03d} block={block_display} "
             f"base={meta['baseline_loss']:.6f} best={meta['best_loss']:.6f} "
             f"delta={meta['improvement']:.6f} swap=({meta['start_a']},{meta['start_b']}) finalists={meta.get('finalists')}"
         )
@@ -890,6 +972,7 @@ def main() -> None:
                 state.loss_cache[encode_permutation(permutation)] = loss
         print(f"resumed generation {state.generation} with population {len(state.population)} and block size {state.block_size}")
 
+    elite_block_exhaustion: dict[bytes, int] = {}
     stop_requested = {"value": False}
 
     def handle_signal(signum: int, _frame: object) -> None:
@@ -902,6 +985,21 @@ def main() -> None:
         generation_start = time.time()
         state.generation += 1
         print(f"\n=== generation {state.generation} max_block_size={state.block_size} ===")
+        current_population_keys = {encode_permutation(permutation) for permutation in state.population}
+        elite_block_exhaustion = {
+            permutation_key: exhausted_block_size
+            for permutation_key, exhausted_block_size in elite_block_exhaustion.items()
+            if permutation_key in current_population_keys
+        }
+        elite_count = min(len(state.population), max(1, min(args.survivors, len(state.population)) // 2))
+        ranked_current = sorted(
+            zip(state.population, state.population_losses),
+            key=lambda item: item[1],
+        )
+        elite_keys = {
+            encode_permutation(permutation)
+            for permutation, _ in ranked_current[:elite_count]
+        }
 
         improved_population, improvements, improved_losses = improve_population(
             state.population,
@@ -912,6 +1010,8 @@ def main() -> None:
             args,
             rng,
             torch_generator,
+            elite_keys,
+            elite_block_exhaustion,
         )
         for permutation, loss in zip(improved_population, improved_losses):
             state.loss_cache[encode_permutation(permutation)] = loss
@@ -923,7 +1023,6 @@ def main() -> None:
         best_perm, best_full_loss = ranked[0]
         median_loss = ranked[len(ranked) // 2][1]
         avg_improvement = sum(improvements) / max(len(improvements), 1)
-        elite_count = min(len(improved_population), max(1, min(args.survivors, len(improved_population)) // 2))
         elite_avg_improvement = (
             sum(item[2] for item in ranked_with_improvement[:elite_count]) / elite_count
             if elite_count > 0
