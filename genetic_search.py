@@ -27,7 +27,7 @@ REFINE_SAMPLE_SIZE = 2048
 TOP_K_INITIAL = 32
 TOP_K_FULL_4 = 4
 TOP_K_FULL_8 = 8
-SMALL_DELTA_RATIO = 1e-3
+SMALL_DELTA_RATIO = 1e-2
 HUBER_DELTA = 1.0
 DEFAULT_POPULATION_SIZE = 64
 DEFAULT_SURVIVOR_COUNT = 32
@@ -111,7 +111,7 @@ def huber_loss_from_predictions(predictions: torch.Tensor, target: torch.Tensor)
 
 
 def scaled_small_delta(loss_scale: float, ratio: float = SMALL_DELTA_RATIO) -> float:
-    return max(1e-6, abs(loss_scale) * ratio)
+    return max(1e-4, abs(loss_scale) * ratio)
 
 
 def load_dataset(device: torch.device) -> DatasetBundle:
