@@ -914,21 +914,47 @@ def select_survivors(
     population: Sequence[tuple[str, ...]],
     losses: Sequence[float],
     improvements: Sequence[float],
+    prior_losses: Sequence[float],
     survivor_count: int,
 ) -> list[tuple[tuple[str, ...], float]]:
     if survivor_count <= 0 or not population:
         return []
 
-    indexed = list(zip(population, losses, improvements))
+    indexed = list(zip(population, losses, improvements, prior_losses))
     elite_count = min(len(indexed), max(1, survivor_count // 2))
     ranked_by_loss = sorted(indexed, key=lambda item: item[1])
     elites = ranked_by_loss[:elite_count]
     non_elites = ranked_by_loss[elite_count:]
     remaining_slots = max(0, survivor_count - len(elites))
-    promoted = sorted(non_elites, key=lambda item: (-item[2], item[1]))[:remaining_slots]
+
+    loss_ranks = {
+        id(item): rank
+        for rank, item in enumerate(ranked_by_loss)
+    }
+    ranked_by_relative_improvement = sorted(
+        indexed,
+        key=lambda item: (
+            -(item[2] / max(item[3], 1e-12)),
+            item[1],
+        ),
+    )
+    relative_improvement_ranks = {
+        id(item): rank
+        for rank, item in enumerate(ranked_by_relative_improvement)
+    }
+
+    promoted = sorted(
+        non_elites,
+        key=lambda item: (
+            loss_ranks[id(item)] + 0.3 * relative_improvement_ranks[id(item)],
+            loss_ranks[id(item)],
+            -item[2] / max(item[3], 1e-12),
+            item[1],
+        ),
+    )[:remaining_slots]
 
     selected = elites + promoted
-    return [(permutation, loss) for permutation, loss, _ in selected]
+    return [(permutation, loss) for permutation, loss, _, _ in selected]
 
 
 def main() -> None:
@@ -1047,11 +1073,12 @@ def main() -> None:
             improved_population,
             improved_losses,
             improvements,
+            state.population_losses,
             survivor_target,
         )
         survivors = [perm for perm, _ in survivor_pairs]
         survivor_losses = [loss for _, loss in survivor_pairs]
-        print(f"selection: elites={elite_count} improvement_slots={max(0, survivor_target - elite_count)}")
+        print(f"selection: elites={elite_count} blended_slots={max(0, survivor_target - elite_count)}")
         combinations = choose_combination_children(survivors, args.combination_children, final_layer_id, rng)
         cache_keys = set(state.loss_cache)
         survivor_set = {encode_permutation(permutation) for permutation in survivors}
