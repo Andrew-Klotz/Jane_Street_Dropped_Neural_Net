@@ -31,8 +31,8 @@ SMALL_DELTA_RATIO = 1e-2
 HUBER_DELTA = 1.0
 DEFAULT_POPULATION_SIZE = 64
 DEFAULT_SURVIVOR_COUNT = 32
-DEFAULT_RANDOM_INJECTIONS = 16
-DEFAULT_COMBINATION_CHILDREN = 16
+DEFAULT_RANDOM_INJECTIONS = 0
+DEFAULT_COMBINATION_CHILDREN = 32
 DEFAULT_MAX_BLOCK_SIZE = 8
 CHECKPOINT_EVERY = 1
 RELATIVE_WEIGHTING = 0.5
@@ -1109,6 +1109,7 @@ def main() -> None:
         print(f"resumed generation {state.generation} with population {len(state.population)} and block size {state.block_size}")
 
     elite_block_exhaustion: dict[bytes, int] = {}
+    full_best_history: list[float] = []
     stagnant_generations = 0
     stop_requested = {"value": False}
 
@@ -1194,9 +1195,26 @@ def main() -> None:
             state.best_loss = best_full_loss
             print(f"new best full pred loss {best_full_loss:.8f}")
 
+        full_best_delta_10 = (
+            full_best_history[-10] - best_full_loss
+            if len(full_best_history) >= 10
+            else None
+        )
+        full_best_delta_25 = (
+            full_best_history[-25] - best_full_loss
+            if len(full_best_history) >= 25
+            else None
+        )
+        full_best_history.append(best_full_loss)
+
+        delta_10_display = "n/a" if full_best_delta_10 is None else f"{full_best_delta_10:.8f}"
+        delta_25_display = "n/a" if full_best_delta_25 is None else f"{full_best_delta_25:.8f}"
+
         print(
             f"generation {state.generation} summary: full_best={best_full_loss:.8f} "
             f"full_median={median_loss:.8f} "
+            f"full_best_delta_10={delta_10_display} "
+            f"full_best_delta_25={delta_25_display} "
             f"avg_swap_delta={avg_improvement:.8f} "
             f"elite_avg_swap_delta={elite_avg_improvement:.8f} "
             f"stagnant_generations={stagnant_generations} "
