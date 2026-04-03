@@ -31,14 +31,15 @@ SMALL_DELTA_RATIO = 1e-2
 HUBER_DELTA = 1.0
 DEFAULT_POPULATION_SIZE = 64
 DEFAULT_SURVIVOR_COUNT = 32
-DEFAULT_RANDOM_INJECTIONS = 0
-DEFAULT_COMBINATION_CHILDREN = 32
+DEFAULT_RANDOM_INJECTIONS = 16
+DEFAULT_COMBINATION_CHILDREN = 16
 DEFAULT_MAX_BLOCK_SIZE = 8
 CHECKPOINT_EVERY = 1
 RELATIVE_WEIGHTING = 0.5
 STAGNATION_TRIGGER_GENERATIONS = 5
 STAGNATION_PROBE_BLOCK_SIZES = (1, 2, 4, 8, 12, 16, 24, 32)
 STAGNATION_PROBE_ELITES = 8
+BUBBLE_SORT_ELITES = 4
 
 @dataclass(frozen=True)
 class AffineLayer:
@@ -96,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k-initial", type=int, default=TOP_K_INITIAL)
     parser.add_argument("--top-k-full-4", type=int, default=TOP_K_FULL_4)
     parser.add_argument("--top-k-full-8", type=int, default=TOP_K_FULL_8)
+    parser.add_argument("--enable-elite-bubble-search", action="store_true")
     return parser.parse_args()
 
 
@@ -228,6 +230,17 @@ def build_permutation(even_sequence: Sequence[str], odd_sequence: Sequence[str],
         body.append(even_sequence[idx])
         body.append(odd_sequence[idx])
     return tuple(body + [final_layer_id])
+
+
+def zero_improvement_meta(baseline_full_loss: float) -> dict[str, float | int | None]:
+    return {
+        "baseline_loss": baseline_full_loss,
+        "best_loss": baseline_full_loss,
+        "improvement": 0.0,
+        "start_a": None,
+        "start_b": None,
+        "finalists": 0,
+    }
 
 
 def encode_permutation(permutation: Sequence[str]) -> bytes:
@@ -793,71 +806,188 @@ def choose_combination_children(
     return children
 
 
-def improve_population(
-    population: Sequence[tuple[str, ...]],
-    population_losses: Sequence[float],
+def swap_adjacent_residual_blocks(
+    permutation: Sequence[str],
+    block_idx: int,
+    final_layer_id: str,
+) -> tuple[str, ...]:
+    even_sequence, odd_sequence = split_by_parity(permutation, final_layer_id)
+    if block_idx < 0 or block_idx + 1 >= len(even_sequence):
+        raise ValueError(f"Invalid residual block index {block_idx}")
+    even_sequence[block_idx], even_sequence[block_idx + 1] = even_sequence[block_idx + 1], even_sequence[block_idx]
+    odd_sequence[block_idx], odd_sequence[block_idx + 1] = odd_sequence[block_idx + 1], odd_sequence[block_idx]
+    return build_permutation(even_sequence, odd_sequence, final_layer_id)
+
+
+@torch.inference_mode()
+def evaluate_adjacent_block_swap_loss(
+    perm_even_indices: torch.Tensor,
+    perm_odd_indices: torch.Tensor,
+    prefix_states: Sequence[torch.Tensor],
+    block_idx: int,
+    layer_store: LayerStore,
+    dataset: DatasetBundle,
+) -> float:
+    state = prefix_states[block_idx]
+
+    first_even_weight = layer_store.even_weights[perm_even_indices[block_idx + 1]]
+    first_even_bias = layer_store.even_biases[perm_even_indices[block_idx + 1]]
+    hidden = torch.relu(torch.matmul(state, first_even_weight.t()) + first_even_bias)
+    first_odd_weight = layer_store.odd_weights[perm_odd_indices[block_idx + 1]]
+    first_odd_bias = layer_store.odd_biases[perm_odd_indices[block_idx + 1]]
+    state = state + torch.matmul(hidden, first_odd_weight.t()) + first_odd_bias
+
+    second_even_weight = layer_store.even_weights[perm_even_indices[block_idx]]
+    second_even_bias = layer_store.even_biases[perm_even_indices[block_idx]]
+    hidden = torch.relu(torch.matmul(state, second_even_weight.t()) + second_even_bias)
+    second_odd_weight = layer_store.odd_weights[perm_odd_indices[block_idx]]
+    second_odd_bias = layer_store.odd_biases[perm_odd_indices[block_idx]]
+    boundary_state = state + torch.matmul(hidden, second_odd_weight.t()) + second_odd_bias
+
+    predictions = forward_shared_tail_from_boundary(
+        perm_even_indices,
+        perm_odd_indices,
+        layer_store,
+        boundary_state,
+        2 * (block_idx + 2),
+    )
+    return float(huber_loss_from_predictions(predictions, dataset.pred)[0].item())
+
+
+def bubble_adjacent_block_search(
+    permutation: Sequence[str],
+    layer_store: LayerStore,
+    dataset: DatasetBundle,
+    baseline_full_loss: float,
+    loss_cache: dict[bytes, float],
+) -> tuple[tuple[str, ...], dict[str, float | int | None]]:
+    current_permutation = tuple(permutation)
+    current_loss = baseline_full_loss
+    adjacent_swaps = 0
+    block_count = ALT_LENGTH // 2
+
+    for direction in (range(block_count - 1), range(block_count - 2, -1, -1)):
+        perm_even_indices, perm_odd_indices = permutation_to_index_sequences(
+            current_permutation,
+            layer_store,
+            dataset.inputs.device,
+        )
+        prefix_states = prefix_states_for_permutation(
+            perm_even_indices,
+            perm_odd_indices,
+            layer_store,
+            dataset.inputs,
+        )
+
+        for block_idx in direction:
+            candidate = swap_adjacent_residual_blocks(
+                current_permutation,
+                block_idx,
+                layer_store.final_layer_id,
+            )
+            candidate_key = encode_permutation(candidate)
+            candidate_loss = loss_cache.get(candidate_key)
+            if candidate_loss is None:
+                candidate_loss = evaluate_adjacent_block_swap_loss(
+                    perm_even_indices,
+                    perm_odd_indices,
+                    prefix_states,
+                    block_idx,
+                    layer_store,
+                    dataset,
+                )
+                loss_cache[candidate_key] = candidate_loss
+
+            if candidate_loss < current_loss:
+                current_permutation = candidate
+                current_loss = candidate_loss
+                adjacent_swaps += 1
+                perm_even_indices, perm_odd_indices = permutation_to_index_sequences(
+                    current_permutation,
+                    layer_store,
+                    dataset.inputs.device,
+                )
+                prefix_states = prefix_states_for_permutation(
+                    perm_even_indices,
+                    perm_odd_indices,
+                    layer_store,
+                    dataset.inputs,
+                )
+
+    if current_loss >= baseline_full_loss:
+        return tuple(permutation), zero_improvement_meta(baseline_full_loss)
+
+    return current_permutation, {
+        "baseline_loss": baseline_full_loss,
+        "best_loss": current_loss,
+        "improvement": baseline_full_loss - current_loss,
+        "start_a": None,
+        "start_b": None,
+        "finalists": adjacent_swaps,
+    }
+
+
+def run_swap_search(
+    permutation: Sequence[str],
+    permutation_key: bytes,
+    baseline_loss: float,
     layer_store: LayerStore,
     dataset: DatasetBundle,
     max_block_size: int,
     args: argparse.Namespace,
     rng: random.Random,
     torch_generator: torch.Generator,
-    elite_keys: set[bytes],
+    is_elite: bool,
     elite_block_exhaustion: dict[bytes, int],
-) -> tuple[list[tuple[str, ...]], list[float], list[float]]:
-    improved_population: list[tuple[str, ...]] = []
-    improvements: list[float] = []
-    improved_losses: list[float] = []
+) -> tuple[tuple[str, ...], dict[str, float | int | None], str]:
+    exhausted_max_block_size = elite_block_exhaustion.get(permutation_key, 0)
+    attempted_block_sizes: list[int] = []
 
-    for idx, (permutation, baseline_loss) in enumerate(zip(population, population_losses), start=1):
-        permutation_key = encode_permutation(permutation)
-        is_elite = permutation_key in elite_keys
-        exhausted_max_block_size = elite_block_exhaustion.get(permutation_key, 0)
-        attempted_block_sizes: list[int] = []
+    if is_elite and exhausted_max_block_size >= max_block_size:
+        return tuple(permutation), zero_improvement_meta(baseline_loss), f"skip<={exhausted_max_block_size}/{max_block_size}"
 
-        if is_elite and exhausted_max_block_size >= max_block_size:
-            improved = tuple(permutation)
-            meta: dict[str, float | int | None] = {
-                "baseline_loss": baseline_loss,
-                "best_loss": baseline_loss,
-                "improvement": 0.0,
-                "start_a": None,
-                "start_b": None,
-                "finalists": 0,
-            }
-            block_display = f"skip<={exhausted_max_block_size}/{max_block_size}"
-        else:
-            if is_elite and exhausted_max_block_size > 0:
-                initial_block_size = max_block_size
-                fallback_block_sizes = list(range(max_block_size - 1, exhausted_max_block_size, -1))
-            else:
-                initial_block_size = rng.randint(1, max_block_size)
-                fallback_block_sizes = (
-                    [
-                        block_size
-                        for block_size in range(max_block_size, 0, -1)
-                        if block_size != initial_block_size
-                    ]
-                    if is_elite
-                    else []
-                )
+    if is_elite and exhausted_max_block_size > 0:
+        initial_block_size = max_block_size
+        fallback_block_sizes = list(range(max_block_size - 1, exhausted_max_block_size, -1))
+    else:
+        initial_block_size = rng.randint(1, max_block_size)
+        fallback_block_sizes = (
+            [
+                block_size
+                for block_size in range(max_block_size, 0, -1)
+                if block_size != initial_block_size
+            ]
+            if is_elite
+            else []
+        )
 
-            improved = tuple(permutation)
-            meta = {
-                "baseline_loss": baseline_loss,
-                "best_loss": baseline_loss,
-                "improvement": 0.0,
-                "start_a": None,
-                "start_b": None,
-                "finalists": 0,
-            }
-
-            attempted_block_sizes.append(initial_block_size)
+    improved = tuple(permutation)
+    meta = zero_improvement_meta(baseline_loss)
+    attempted_block_sizes.append(initial_block_size)
+    candidate, candidate_meta = best_swap(
+        permutation,
+        layer_store,
+        dataset,
+        block_size=initial_block_size,
+        baseline_full_loss=baseline_loss,
+        sample_generator=torch_generator,
+        top_k_initial=args.top_k_initial,
+        top_k_full_4=args.top_k_full_4,
+        top_k_full_8=args.top_k_full_8,
+    )
+    meta = candidate_meta
+    if float(candidate_meta["improvement"]) > 0.0:
+        improved = candidate
+        elite_block_exhaustion.pop(permutation_key, None)
+        elite_block_exhaustion.pop(encode_permutation(improved), None)
+    else:
+        for block_size in fallback_block_sizes:
+            attempted_block_sizes.append(block_size)
             candidate, candidate_meta = best_swap(
                 permutation,
                 layer_store,
                 dataset,
-                block_size=initial_block_size,
+                block_size=block_size,
                 baseline_full_loss=baseline_loss,
                 sample_generator=torch_generator,
                 top_k_initial=args.top_k_initial,
@@ -869,44 +999,85 @@ def improve_population(
                 improved = candidate
                 elite_block_exhaustion.pop(permutation_key, None)
                 elite_block_exhaustion.pop(encode_permutation(improved), None)
-            else:
-                for block_size in fallback_block_sizes:
-                    attempted_block_sizes.append(block_size)
-                    candidate, candidate_meta = best_swap(
-                        permutation,
-                        layer_store,
-                        dataset,
-                        block_size=block_size,
-                        baseline_full_loss=baseline_loss,
-                        sample_generator=torch_generator,
-                        top_k_initial=args.top_k_initial,
-                        top_k_full_4=args.top_k_full_4,
-                        top_k_full_8=args.top_k_full_8,
-                    )
-                    meta = candidate_meta
-                    if float(candidate_meta["improvement"]) > 0.0:
-                        improved = candidate
-                        elite_block_exhaustion.pop(permutation_key, None)
-                        elite_block_exhaustion.pop(encode_permutation(improved), None)
-                        break
-                else:
-                    if is_elite:
-                        elite_block_exhaustion[permutation_key] = max_block_size
+                break
+        else:
+            if is_elite:
+                elite_block_exhaustion[permutation_key] = max_block_size
 
-            if attempted_block_sizes:
-                block_display = (
-                    f"{attempted_block_sizes[0]}/{max_block_size}"
-                    if len(attempted_block_sizes) == 1
-                    else f"{','.join(str(size) for size in attempted_block_sizes)}/{max_block_size}"
-                )
-            else:
-                block_display = f"n/a/{max_block_size}"
+    block_display = (
+        f"{attempted_block_sizes[0]}/{max_block_size}"
+        if len(attempted_block_sizes) == 1
+        else f"{','.join(str(size) for size in attempted_block_sizes)}/{max_block_size}"
+    )
+    return improved, meta, block_display
+
+
+def improve_population(
+    population: Sequence[tuple[str, ...]],
+    population_losses: Sequence[float],
+    layer_store: LayerStore,
+    dataset: DatasetBundle,
+    max_block_size: int,
+    args: argparse.Namespace,
+    rng: random.Random,
+    torch_generator: torch.Generator,
+    loss_cache: dict[bytes, float],
+    elite_keys: set[bytes],
+    bubble_elite_keys: set[bytes],
+    elite_block_exhaustion: dict[bytes, int],
+    bubble_search_exhausted: set[bytes],
+) -> tuple[list[tuple[str, ...]], list[float], list[float]]:
+    improved_population: list[tuple[str, ...]] = []
+    improvements: list[float] = []
+    improved_losses: list[float] = []
+
+    for idx, (permutation, baseline_loss) in enumerate(zip(population, population_losses), start=1):
+        permutation_key = encode_permutation(permutation)
+        is_elite = permutation_key in elite_keys
+        search_display = "swap"
+        improved = tuple(permutation)
+        meta = zero_improvement_meta(baseline_loss)
+        block_display = f"n/a/{max_block_size}"
+        bubble_attempted = False
+        bubble_enabled = args.enable_elite_bubble_search and permutation_key in bubble_elite_keys
+
+        if bubble_enabled and permutation_key not in bubble_search_exhausted:
+            bubble_attempted = True
+            search_display = "bubble"
+            improved, meta = bubble_adjacent_block_search(
+                permutation,
+                layer_store,
+                dataset,
+                baseline_loss,
+                loss_cache,
+            )
+            block_display = "adjacent"
+
+        if float(meta["improvement"]) <= 0.0:
+            improved, meta, block_display = run_swap_search(
+                permutation,
+                permutation_key,
+                baseline_loss,
+                layer_store,
+                dataset,
+                max_block_size,
+                args,
+                rng,
+                torch_generator,
+                is_elite,
+                elite_block_exhaustion,
+            )
+            if bubble_enabled:
+                search_display = "bubble-skip->swap" if not bubble_attempted else "bubble->swap"
+
+        if bubble_attempted and float(meta["improvement"]) <= 0.0:
+            bubble_search_exhausted.add(permutation_key)
 
         improved_population.append(improved)
         improvements.append(float(meta["improvement"]))
         improved_losses.append(float(meta["best_loss"]))
         print(
-            f"  perm {idx:03d}/{len(population):03d} block={block_display} "
+            f"  perm {idx:03d}/{len(population):03d} search={search_display} block={block_display} "
             f"base={meta['baseline_loss']:.6f} best={meta['best_loss']:.6f} "
             f"delta={meta['improvement']:.6f} swap=({meta['start_a']},{meta['start_b']}) finalists={meta.get('finalists')}"
         )
@@ -1109,6 +1280,7 @@ def main() -> None:
         print(f"resumed generation {state.generation} with population {len(state.population)} and block size {state.block_size}")
 
     elite_block_exhaustion: dict[bytes, int] = {}
+    bubble_search_exhausted: set[bytes] = set()
     full_best_history: list[float] = []
     stagnant_generations = 0
     stop_requested = {"value": False}
@@ -1138,6 +1310,14 @@ def main() -> None:
             encode_permutation(permutation)
             for permutation, _ in ranked_current[:elite_count]
         }
+        bubble_elite_keys = (
+            {
+                encode_permutation(permutation)
+                for permutation, _ in ranked_current[: min(BUBBLE_SORT_ELITES, len(ranked_current))]
+            }
+            if args.enable_elite_bubble_search
+            else set()
+        )
 
         improved_population, improvements, improved_losses = improve_population(
             state.population,
@@ -1148,8 +1328,11 @@ def main() -> None:
             args,
             rng,
             torch_generator,
+            state.loss_cache,
             elite_keys,
+            bubble_elite_keys,
             elite_block_exhaustion,
+            bubble_search_exhausted,
         )
         prior_losses = list(state.population_losses)
         ranked = sorted(zip(improved_population, improved_losses), key=lambda item: item[1])
